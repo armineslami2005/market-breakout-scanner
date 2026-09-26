@@ -546,7 +546,7 @@ def select_symbols_for_scan(symbols):
     width = min(ROTATING_SYMBOLS, len(rest))
     if width <= 0:
         return core
-  start = (scan_number * width) % len(rest)
+    start = (scan_number * width) % len(rest)
     rotation = [rest[(start + i) % len(rest)] for i in range(width)]
     return list(dict.fromkeys(core + rotation))
 
@@ -1656,4 +1656,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                              
