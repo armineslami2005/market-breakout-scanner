@@ -14,12 +14,12 @@ from urllib.parse import quote_plus, urljoin
 import requests
 
 # ============================================================
-# ARMIN MARKET SCANNER V2.2
+# ARMIN MARKET SCANNER V2.3
 # Quiet, action-first, stateful, interactive and self-auditing.
 # Alert-only: it does NOT place real orders.
 # ============================================================
 
-VERSION = "2.2"
+VERSION = "2.3"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -87,7 +87,7 @@ GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
 SEC_CURRENT = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Armin-Market-Scanner/2.2"})
+session.headers.update({"User-Agent": "Armin-Market-Scanner/2.3"})
 
 last_alert = {}
 news_cache = {}
@@ -104,37 +104,67 @@ scan_number = 0
 
 DB_PATH = os.getenv("DB_PATH", "scanner_v22.db")
 
-# V2.2 reliability / intelligence
-TELEGRAM_POLL_EVERY = float(os.getenv("TELEGRAM_POLL_EVERY", "2"))
-MESSAGE_DEDUPE_SECONDS = int(os.getenv("MESSAGE_DEDUPE_SECONDS", str(6 * 60 * 60)))
+# V2.3 reliability / intelligence
+TELEGRAM_POLL_EVERY = float(os.getenv("TELEGRAM_POLL_EVERY", "1.5"))
 MAX_ENTRY_EXTENSION_PCT = float(os.getenv("MAX_ENTRY_EXTENSION_PCT", "3.0"))
 MAX_15M_ENTRY_MOVE_PCT = float(os.getenv("MAX_15M_ENTRY_MOVE_PCT", "7.0"))
 MIN_TREND_QUALITY = float(os.getenv("MIN_TREND_QUALITY", "0.58"))
+
+# Setup lifecycle: detect -> arm -> re-check at entry -> trigger once / cancel once.
+SETUP_TTL = int(os.getenv("SETUP_TTL", str(45 * 60)))
+ENTRY_ZONE_PCT = float(os.getenv("ENTRY_ZONE_PCT", "0.45"))
+MAX_TRIGGER_OVERSHOOT_PCT = float(os.getenv("MAX_TRIGGER_OVERSHOOT_PCT", "1.25"))
+PREBREAKOUT_SCORE = float(os.getenv("PREBREAKOUT_SCORE", "7.0"))
+PREBREAKOUT_CONFIRM_SCANS = int(os.getenv("PREBREAKOUT_CONFIRM_SCANS", "2"))
+PREBREAKOUT_AUDIT_HORIZON = int(os.getenv("PREBREAKOUT_AUDIT_HORIZON", str(3 * 60 * 60)))
+ANALOG_MIN_SAMPLES = int(os.getenv("ANALOG_MIN_SAMPLES", "18"))
+ANALOG_MAX_NEIGHBORS = int(os.getenv("ANALOG_MAX_NEIGHBORS", "12"))
+
 telegram_poll_lock = threading.Lock()
 telegram_send_lock = threading.Lock()
-recent_message_hashes = {}
+analog_cache = {"ts": 0, "samples": []}
 
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _message_fingerprint(message):
-    # Exact-message idempotency. Prevents accidental repeated Telegram sends in one runtime.
-    return hashlib.sha256((str(CHAT_ID) + "|" + message.strip()).encode("utf-8")).hexdigest()
+def _event_claim(event_key):
+    """Persistent idempotency for alerts. Returns True exactly once per event key."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=5) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            cur = con.execute(
+                "INSERT OR IGNORE INTO sent_events(event_key,sent_ts) VALUES(?,?)",
+                (str(event_key), time.time()),
+            )
+            return cur.rowcount == 1
+    except Exception as exc:
+        print("Event-claim error:", exc)
+        return False
 
 
-def _message_is_duplicate(message):
-    now = time.time()
-    fp = _message_fingerprint(message)
-    # prune old hashes
-    for key, ts in list(recent_message_hashes.items()):
-        if now - ts > MESSAGE_DEDUPE_SECONDS:
-            recent_message_hashes.pop(key, None)
-    if now - recent_message_hashes.get(fp, 0) < MESSAGE_DEDUPE_SECONDS:
-        return True
-    recent_message_hashes[fp] = now
-    return False
+def _event_unclaim(event_key):
+    try:
+        with sqlite3.connect(DB_PATH, timeout=5) as con:
+            con.execute("DELETE FROM sent_events WHERE event_key=?", (str(event_key),))
+    except Exception:
+        pass
+
+
+def _claim_telegram_update(update_id):
+    """Prevents a Telegram update from being processed more than once."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=5) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            cur = con.execute(
+                "INSERT OR IGNORE INTO processed_telegram_updates(update_id,processed_ts) VALUES(?,?)",
+                (int(update_id), time.time()),
+            )
+            return cur.rowcount == 1
+    except Exception as exc:
+        print("Telegram update claim error:", exc)
+        return False
 
 
 def _ensure_column(con, table, name, ddl):
@@ -144,7 +174,9 @@ def _ensure_column(con, table, name, ddl):
 
 
 def db_init():
-    with sqlite3.connect(DB_PATH) as con:
+    with sqlite3.connect(DB_PATH, timeout=5) as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS alerts (
@@ -217,6 +249,43 @@ def db_init():
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_events (
+                event_key TEXT PRIMARY KEY,
+                sent_ts REAL NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_telegram_updates (
+                update_id INTEGER PRIMARY KEY,
+                processed_ts REAL NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_setups (
+                setup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                updated_ts REAL NOT NULL,
+                state TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                stop_price REAL,
+                target_price REAL,
+                score REAL,
+                reason TEXT,
+                expires_ts REAL,
+                trigger_ts REAL,
+                details TEXT
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_active_setups_symbol_state ON active_setups(symbol,state)")
 
 
 def log_alert(symbol, alert_type, price=None, score=None, details=None):
@@ -261,7 +330,6 @@ def save_position(symbol, p):
             )
     except Exception as exc:
         print("DB position error:", exc)
-
 
 def load_positions():
     try:
@@ -335,27 +403,23 @@ def set_meta(key, value):
 
 
 def telegram(message, reply_markup=None, chat_id=None):
+    """Plain Telegram send. Command replies are deduped by update-id, not message text."""
     target = str(chat_id or CHAT_ID or "").strip()
     if not BOT_TOKEN or not target:
         print("[TELEGRAM NOT CONFIGURED]")
         print(message)
         return False
 
-    # V2.2 exact-message idempotency: one identical message per dedupe window.
-    with telegram_send_lock:
-        if _message_is_duplicate(message):
-            print("[TELEGRAM DEDUPE]", message.splitlines()[0][:100])
-            return False
-
     payload = {"chat_id": target, "text": message}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json=payload,
-            timeout=12,
-        )
+        with telegram_send_lock:
+            r = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json=payload,
+                timeout=12,
+            )
         if not r.ok:
             print("Telegram error:", r.status_code, r.text[:200])
             return False
@@ -363,6 +427,17 @@ def telegram(message, reply_markup=None, chat_id=None):
     except Exception as exc:
         print("Telegram exception:", exc)
         return False
+
+
+def telegram_once(event_key, message, reply_markup=None, chat_id=None):
+    """Send one alert exactly once for a persistent event key."""
+    if not _event_claim(event_key):
+        print("[EVENT DEDUPE]", event_key)
+        return False
+    ok = telegram(message, reply_markup=reply_markup, chat_id=chat_id)
+    if not ok:
+        _event_unclaim(event_key)
+    return ok
 
 
 def telegram_answer_callback(callback_id, text):
@@ -551,13 +626,12 @@ def select_symbols_for_scan(symbols):
     return list(dict.fromkeys(core + rotation))
 
 
-def get_klines(symbol, limit=45):
+def get_klines(symbol, limit=90):
     return binance_json(
         "/api/v3/klines",
         params={"symbol": symbol, "interval": "1m", "limit": limit},
         timeout=10,
     )
-
 
 def safe_mean(xs):
     return statistics.mean(xs) if xs else 0.0
@@ -570,26 +644,33 @@ def pct(a, b):
 
 
 def analyse(symbol):
-    candles = get_klines(symbol, 45)
-    if not isinstance(candles, list) or len(candles) < 40:
+    # 90 one-minute candles gives V2.3 enough context to distinguish
+    # quiet accumulation from a move that is already late/exhausted.
+    candles = get_klines(symbol, 90)
+    if not isinstance(candles, list) or len(candles) < 75:
         return None
 
-    closes = [float(x[4]) for x in candles]
+    opens = [float(x[1]) for x in candles]
     highs = [float(x[2]) for x in candles]
     lows = [float(x[3]) for x in candles]
+    closes = [float(x[4]) for x in candles]
     volumes = [float(x[5]) for x in candles]
     taker_buy = [float(x[9]) for x in candles]
     trades = [float(x[8]) for x in candles]
 
     price = closes[-1]
-    baseline_vol = safe_mean(volumes[-40:-10])
+    baseline_vol = safe_mean(volumes[-80:-20])
     recent3_vol = safe_mean(volumes[-3:])
     prev3_vol = safe_mean(volumes[-6:-3])
+    recent10_vol = safe_mean(volumes[-10:])
+    prior10_vol = safe_mean(volumes[-20:-10])
     if baseline_vol <= 0:
         return None
 
     volume_ratio = recent3_vol / baseline_vol
     volume_accel = recent3_vol / max(prev3_vol, 1e-12)
+    volume_slope = recent10_vol / max(prior10_vol, 1e-12)
+
     recent3_trades = safe_mean(trades[-3:])
     prev3_trades = safe_mean(trades[-6:-3])
     trade_accel = recent3_trades / max(prev3_trades, 1e-12)
@@ -597,36 +678,58 @@ def analyse(symbol):
     recent_volume_sum = sum(volumes[-3:])
     recent_buy_sum = sum(taker_buy[-3:])
     buy_ratio = recent_buy_sum / recent_volume_sum if recent_volume_sum > 0 else 0.0
+    volume10 = sum(volumes[-10:])
+    buy10 = sum(taker_buy[-10:])
+    buy_ratio_10m = buy10 / volume10 if volume10 > 0 else 0.0
     recent_quote_volume_3m = sum(volumes[i] * closes[i] for i in range(len(candles)-3, len(candles)))
 
     move_1m = pct(price, closes[-2])
     move_3m = pct(price, closes[-4])
     move_5m = pct(price, closes[-6])
     move_15m = pct(price, closes[-16])
+    move_30m = pct(price, closes[-31])
+    move_60m = pct(price, closes[-61])
 
-    previous_high = max(highs[-35:-6])
-    previous_low = min(lows[-35:-6])
+    # Resistance deliberately excludes the last five candles so a brand-new
+    # breakout does not immediately redefine its own resistance.
+    previous_high = max(highs[-40:-6])
+    previous_low = min(lows[-40:-6])
     breakout_pct = pct(price, previous_high)
+    distance_to_resistance_pct = breakout_pct
 
-    prior20_high = max(highs[-35:-15])
-    prior20_low = min(lows[-35:-15])
-    recent10_high = max(highs[-15:-5])
-    recent10_low = min(lows[-15:-5])
-    prior_range = (prior20_high - prior20_low) / max(prior20_low, 1e-12)
-    recent_range = (recent10_high - recent10_low) / max(recent10_low, 1e-12)
-    compression = recent_range < prior_range * 0.75 if prior_range > 0 else False
+    prior_high = max(highs[-55:-25])
+    prior_low = min(lows[-55:-25])
+    recent_high = max(highs[-18:-6])
+    recent_low = min(lows[-18:-6])
+    prior_range = (prior_high - prior_low) / max(prior_low, 1e-12)
+    recent_range = (recent_high - recent_low) / max(recent_low, 1e-12)
+    compression_ratio = recent_range / max(prior_range, 1e-12)
+    compression = compression_ratio <= 0.72
 
-    # V2.2 pattern-quality features from the same 1m feed (no extra API latency).
+    # Rising swing-lows are a simple accumulation / pressure feature.
+    old_low = min(lows[-28:-16])
+    mid_low = min(lows[-16:-8])
+    new_low = min(lows[-8:])
+    higher_lows = old_low < mid_low <= new_low
+
     ema9 = safe_mean(closes[-9:])
     ema21 = safe_mean(closes[-21:])
+    ema50 = safe_mean(closes[-50:])
     trend_up = price > ema9 > ema21
+    broader_trend_up = ema9 > ema21 >= ema50 * 0.995
     extension_pct = pct(price, ema21)
-    green_recent = sum(1 for i in range(-6, 0) if closes[i] >= float(candles[i][1]))
+
+    green_recent = sum(1 for i in range(-6, 0) if closes[i] >= opens[i])
     trend_quality = green_recent / 6.0
     breakout_hold = sum(1 for c in closes[-3:] if c >= previous_high * 0.998)
-    last_open = float(candles[-1][1])
+
+    # Volatility expansion after compression is useful; pure wick expansion is not.
+    baseline_ranges = [(highs[i] - lows[i]) / max(closes[i], 1e-12) for i in range(len(candles)-50, len(candles)-10)]
+    recent_ranges = [(highs[i] - lows[i]) / max(closes[i], 1e-12) for i in range(len(candles)-3, len(candles))]
+    range_expansion = safe_mean(recent_ranges) / max(safe_mean(baseline_ranges), 1e-12)
+
+    last_open = opens[-1]
     last_high = highs[-1]
-    last_low = lows[-1]
     body = abs(price - last_open)
     upper_wick = max(0.0, last_high - max(price, last_open))
     wick_rejection = body > 0 and upper_wick > body * 1.8
@@ -660,17 +763,62 @@ def analyse(symbol):
     if false_breakout: score -= 2.0
     if extension_pct > MAX_ENTRY_EXTENSION_PCT: score -= 1.5
 
+    # V2.3 pre-breakout pattern score. The ideal pattern has activity expanding
+    # faster than price: strong volume/trade/buy pressure, compression/higher lows,
+    # proximity to resistance, but no already-exploded 15/30m move.
+    prebreakout_score = 0.0
+    if volume_ratio >= 1.8: prebreakout_score += 1.0
+    if volume_ratio >= 3.0: prebreakout_score += 1.0
+    if volume_accel >= 1.35: prebreakout_score += 1.0
+    if volume_slope >= 1.25: prebreakout_score += 0.75
+    if trade_accel >= 1.20: prebreakout_score += 0.75
+    if buy_ratio >= 0.60: prebreakout_score += 1.0
+    if buy_ratio_10m >= 0.55: prebreakout_score += 0.5
+    if compression: prebreakout_score += 1.0
+    if higher_lows: prebreakout_score += 1.0
+    if -1.5 <= distance_to_resistance_pct <= 0.35: prebreakout_score += 1.0
+    if 0.0 <= move_15m <= 4.0: prebreakout_score += 0.5
+    if -1.0 <= move_30m <= 7.0: prebreakout_score += 0.5
+    if broader_trend_up: prebreakout_score += 0.5
+    if extension_pct <= 2.0: prebreakout_score += 0.5
+    if range_expansion >= 1.15: prebreakout_score += 0.35
+    if move_15m > 5.5: prebreakout_score -= 1.5
+    if move_30m > 10.0: prebreakout_score -= 1.5
+    if extension_pct > 3.0: prebreakout_score -= 1.25
+    if wick_rejection: prebreakout_score -= 1.5
+    if false_breakout: prebreakout_score -= 2.0
+    if recent_quote_volume_3m < MIN_RECENT_3M_QUOTE_VOLUME: prebreakout_score -= 1.0
+
+    # "Activity leads price" is a core V2.3 pattern: unusual participation while
+    # the price move is still modest enough to offer asymmetric entry potential.
+    activity_leads_price = (
+        volume_ratio >= 2.2
+        and volume_accel >= 1.25
+        and buy_ratio >= 0.58
+        and abs(move_5m) <= 2.8
+        and move_15m <= 4.5
+        and -1.8 <= distance_to_resistance_pct <= 0.4
+    )
+
     rapid_move = move_5m >= 8.0 or move_3m >= 6.0
 
     return {
         "symbol": symbol, "price": price, "volume_ratio": volume_ratio,
-        "volume_accel": volume_accel, "trade_accel": trade_accel,
-        "buy_ratio": buy_ratio, "recent_quote_volume_3m": recent_quote_volume_3m,
+        "volume_accel": volume_accel, "volume_slope": volume_slope,
+        "trade_accel": trade_accel, "buy_ratio": buy_ratio,
+        "buy_ratio_10m": buy_ratio_10m,
+        "recent_quote_volume_3m": recent_quote_volume_3m,
         "move_1m": move_1m, "move_3m": move_3m, "move_5m": move_5m,
-        "move_15m": move_15m, "previous_high": previous_high,
-        "previous_low": previous_low, "breakout_pct": breakout_pct,
-        "compression": compression, "score": score, "rapid_move": rapid_move,
-        "trend_up": trend_up, "trend_quality": trend_quality,
+        "move_15m": move_15m, "move_30m": move_30m, "move_60m": move_60m,
+        "previous_high": previous_high, "previous_low": previous_low,
+        "breakout_pct": breakout_pct,
+        "distance_to_resistance_pct": distance_to_resistance_pct,
+        "compression": compression, "compression_ratio": compression_ratio,
+        "higher_lows": higher_lows, "range_expansion": range_expansion,
+        "score": score, "prebreakout_score": prebreakout_score,
+        "activity_leads_price": activity_leads_price, "rapid_move": rapid_move,
+        "trend_up": trend_up, "broader_trend_up": broader_trend_up,
+        "trend_quality": trend_quality,
         "breakout_hold": breakout_hold, "extension_pct": extension_pct,
         "wick_rejection": wick_rejection, "false_breakout": false_breakout,
     }
@@ -708,7 +856,9 @@ CATALYST_WORDS = {
     "hack": -4,
     "exploit": -4,
     "delist": -4,
-    "unlock": -1,
+    "unlock": -3,
+    "token unlock": -4,
+    "vesting": -2,
 }
 
 
@@ -818,7 +968,6 @@ def trade_plan(x, action):
         "net_rr": round(net_rr, 2), "sensible": sensible,
     }
 
-
 def record_signal_event(symbol, action, x, plan=None, reason=""):
     # Avoid creating duplicate open events for the same symbol/action.
     try:
@@ -877,6 +1026,13 @@ def update_signal_outcomes(price_map):
                             result = "LOSS"
                         else:
                             result = "FLAT"
+                elif action == "PRE_BREAKOUT":
+                    if max_gain >= 12.0:
+                        result = "EXPLODED"
+                    elif stop and price <= stop:
+                        result = "FAILED"
+                    elif now - ts >= PREBREAKOUT_AUDIT_HORIZON:
+                        result = "QUIET" if max_gain < 6.0 else "MISSED"
                 elif action == "WATCH":
                     if max_gain >= 8.0:
                         result = "MISSED"
@@ -893,6 +1049,8 @@ def update_signal_outcomes(price_map):
                         "UPDATE signal_events SET max_gain_pct=?,max_drawdown_pct=? WHERE id=?",
                         (max_gain, max_dd, event_id),
                     )
+        # Outcome changes can affect analog memory; refresh on next request.
+        analog_cache["ts"] = 0
     except Exception as exc:
         print("Outcome audit error:", exc)
 
@@ -946,94 +1104,214 @@ def learning_summary():
             ).fetchall()
         buys = [r for r in rows if r[0] in ("BUY_NOW", "SPEC_BUY")]
         wins = sum(1 for _, result in buys if result == "WIN")
-        losses = sum(1 for _, result in buys if result == "LOSS")
+        pre = [r for r in rows if r[0] == "PRE_BREAKOUT"]
+        exploded = sum(1 for _, result in pre if result == "EXPLODED")
         watches = [r for r in rows if r[0] == "WATCH"]
         missed = sum(1 for _, result in watches if result == "MISSED")
-        if not buys and not watches:
+        if not buys and not watches and not pre:
             return "🧠 Learning: collecting evidence. No completed samples yet."
         win_rate = (wins / len(buys) * 100) if buys else 0
-        return f"🧠 Learning: {len(buys)} trades audited • {win_rate:.0f}% wins • {missed} missed moves found."
+        pre_rate = (exploded / len(pre) * 100) if pre else 0
+        return (
+            f"🧠 Learning: {len(buys)} entries audited • {win_rate:.0f}% wins • "
+            f"{len(pre)} pre-breakouts audited ({pre_rate:.0f}% exploded) • {missed} missed moves."
+        )
     except Exception:
         return "🧠 Learning data isn't available right now."
+
+
+ANALOG_FEATURES = {
+    "volume_ratio": 3.0,
+    "volume_accel": 2.0,
+    "volume_slope": 2.0,
+    "trade_accel": 2.0,
+    "buy_ratio": 0.20,
+    "buy_ratio_10m": 0.20,
+    "move_5m": 4.0,
+    "move_15m": 7.0,
+    "distance_to_resistance_pct": 2.0,
+    "compression_ratio": 0.6,
+    "extension_pct": 4.0,
+    "prebreakout_score": 5.0,
+}
+
+
+def _load_analog_samples(force=False):
+    now = time.time()
+    if not force and now - analog_cache.get("ts", 0) < 300:
+        return analog_cache.get("samples", [])
+    samples = []
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            rows = con.execute(
+                """
+                SELECT action,result,details FROM signal_events
+                WHERE status='RESOLVED' AND result IS NOT NULL
+                ORDER BY id DESC LIMIT 180
+                """
+            ).fetchall()
+        for action, result, details in rows:
+            try:
+                payload = json.loads(details or "{}")
+                sig = payload.get("signal") or {}
+            except Exception:
+                continue
+            if not all(k in sig for k in ("volume_ratio", "buy_ratio", "move_5m")):
+                continue
+            if result in ("WIN", "EXPLODED", "MISSED"):
+                label = 1.0
+            elif result in ("LOSS", "QUIET", "FAILED"):
+                label = 0.0
+            else:
+                continue
+            samples.append((sig, label))
+    except Exception as exc:
+        print("Analog sample load error:", exc)
+    analog_cache["ts"] = now
+    analog_cache["samples"] = samples
+    return samples
+
+
+def historical_analog_edge(x):
+    """Bounded nearest-pattern adjustment from the scanner's own audited history."""
+    samples = _load_analog_samples()
+    if len(samples) < ANALOG_MIN_SAMPLES:
+        return 0.0
+    neighbors = []
+    for sig, label in samples:
+        d2 = 0.0
+        used = 0
+        for key, scale in ANALOG_FEATURES.items():
+            if key not in x or key not in sig:
+                continue
+            try:
+                delta = (float(x[key]) - float(sig[key])) / max(scale, 1e-9)
+            except Exception:
+                continue
+            d2 += delta * delta
+            used += 1
+        if used >= 7:
+            dist = math.sqrt(d2 / used)
+            neighbors.append((dist, label))
+    if len(neighbors) < ANALOG_MIN_SAMPLES // 2:
+        return 0.0
+    neighbors.sort(key=lambda z: z[0])
+    chosen = neighbors[:ANALOG_MAX_NEIGHBORS]
+    weighted = 0.0
+    total_w = 0.0
+    for dist, label in chosen:
+        w = 1.0 / max(0.20, dist)
+        weighted += w * label
+        total_w += w
+    success = weighted / total_w if total_w else 0.5
+    # Never let analog memory dominate the hard safety gates.
+    return max(-0.55, min(0.55, (success - 0.5) * 1.4))
 
 
 def update_candidate_memory(x):
     symbol = x["symbol"]
     now = time.time()
+    previous = candidate_memory.get(symbol) or {"hits": 0, "pre_hits": 0, "last_seen": 0}
+    fresh = now - previous.get("last_seen", 0) <= 180
+
     strong = (
         x["score"] >= WATCH_SCORE
         and x["recent_quote_volume_3m"] >= MIN_RECENT_3M_QUOTE_VOLUME
         and not x["rapid_move"]
     )
-    previous = candidate_memory.get(symbol)
-    if strong:
-        if previous and now - previous["last_seen"] <= 180:
-            hits = previous["hits"] + 1
-        else:
-            hits = 1
-        candidate_memory[symbol] = {
-            "hits": min(hits, 10), "last_seen": now, "score": x["score"],
-            "price": x["price"], "breakout_pct": x["breakout_pct"],
-        }
-    elif previous:
-        previous["hits"] = max(0, previous["hits"] - 1)
-        previous["last_seen"] = now
-    return candidate_memory.get(symbol, {}).get("hits", 0)
+    pre_strong = (
+        x.get("prebreakout_score", 0) >= PREBREAKOUT_SCORE - 0.4
+        and x.get("activity_leads_price", False)
+        and x["recent_quote_volume_3m"] >= MIN_RECENT_3M_QUOTE_VOLUME
+        and not x["rapid_move"]
+    )
+
+    hits = previous.get("hits", 0) + 1 if strong and fresh else (1 if strong else max(0, previous.get("hits", 0) - 1))
+    pre_hits = previous.get("pre_hits", 0) + 1 if pre_strong and fresh else (1 if pre_strong else max(0, previous.get("pre_hits", 0) - 1))
+    candidate_memory[symbol] = {
+        "hits": min(hits, 10), "pre_hits": min(pre_hits, 10), "last_seen": now,
+        "score": x["score"], "prebreakout_score": x.get("prebreakout_score", 0),
+        "price": x["price"], "breakout_pct": x["breakout_pct"],
+    }
+    return candidate_memory[symbol]["hits"], candidate_memory[symbol]["pre_hits"]
 
 
 def market_context(results):
     btc = next((x for x in results if x["symbol"] == "BTCUSDT"), None)
     advancers = sum(1 for x in results if x.get("move_15m", 0) > 0)
+    strong_advancers = sum(1 for x in results if x.get("move_15m", 0) >= 3.0)
     breadth = advancers / max(len(results), 1)
+    hot_breadth = strong_advancers / max(len(results), 1)
     btc15 = btc["move_15m"] if btc else 0.0
     return {
         "risk_off": btc15 <= -1.8 or breadth < 0.30,
-        "overheated": breadth > 0.82 and btc15 > 2.5,
+        "overheated": (breadth > 0.82 and btc15 > 2.5) or hot_breadth > 0.32,
         "btc_15m": btc15,
         "breadth": breadth,
+        "hot_breadth": hot_breadth,
     }
 
 
 def decide_action(x, context):
-    hits = update_candidate_memory(x)
+    hits, pre_hits = update_candidate_memory(x)
     bias = context.get("learning_bias", 0.0)
     risk_penalty = 0.75 if context.get("risk_off") and x["symbol"] not in ("BTCUSDT", "ETHUSDT") else 0.0
+    analog = historical_analog_edge(x)
+    x["analog_edge"] = analog
 
-    # V2.2 hard quality gates: reject false breakouts, exhaustion and poor structure.
+    # Hard vetoes come before any learned/analog adjustment.
     if x.get("false_breakout") or x.get("wick_rejection"):
-        return "NONE", "Rejected: price showed breakout rejection rather than clean continuation."
+        return "NONE", "Rejected: breakout rejection is stronger than continuation evidence."
     if x.get("extension_pct", 0) > MAX_ENTRY_EXTENSION_PCT or x.get("move_15m", 0) > MAX_15M_ENTRY_MOVE_PCT:
-        return "AVOID_CHASE", "Rejected: the move is too extended for a fresh entry."
+        return "AVOID_CHASE", "Rejected: the move is already too extended for a fresh entry."
     if context.get("overheated") and x.get("move_5m", 0) > 3.5:
-        return "NONE", "Market-wide momentum is overheated; waiting instead of chasing."
-
-    # Extended pumps are not entries. Weak buyer control makes them especially dangerous.
+        return "NONE", "The market is broadly overheated; this entry is too late to chase."
     if x["rapid_move"]:
         if x["move_5m"] >= 10.0 and x["buy_ratio"] < 0.52:
             return "AVOID_CHASE", "The move is already extended and buyer control is weak."
         return "NONE", "The move is already extended; waiting for a reset."
 
-    buy_threshold = BUY_SCORE + bias + risk_penalty
+    # PRE_BREAKOUT is deliberately evaluated before a normal WATCH. It looks for
+    # the pattern seen before many top movers: activity expands before price does.
+    pre_threshold = PREBREAKOUT_SCORE + max(0.0, bias * 0.35) - analog * 0.60
+    prebreakout = (
+        not context.get("risk_off")
+        and pre_hits >= PREBREAKOUT_CONFIRM_SCANS
+        and x.get("prebreakout_score", 0) >= pre_threshold
+        and x.get("activity_leads_price", False)
+        and x.get("volume_ratio", 0) >= 2.0
+        and x.get("buy_ratio", 0) >= 0.58
+        and x.get("buy_ratio_10m", 0) >= 0.53
+        and x.get("trade_accel", 0) >= 1.10
+        and -1.7 <= x.get("distance_to_resistance_pct", -99) <= 0.35
+        and x.get("move_15m", 99) <= 4.5
+        and x.get("move_30m", 99) <= 8.0
+        and x.get("extension_pct", 99) <= 2.4
+    )
+    if prebreakout:
+        return "PRE_BREAKOUT", "Pre-breakout accumulation persisted: activity is accelerating faster than price near resistance."
+
+    buy_threshold = BUY_SCORE + bias + risk_penalty - analog * 0.35
     confirmed = (
         hits >= DECISION_CONFIRM_SCANS
         and x["score"] >= buy_threshold
         and x["volume_ratio"] >= 1.8
         and x["buy_ratio"] >= 0.56
         and x["trade_accel"] >= 1.05
-        and 0.5 <= x["move_5m"] <= 5.5
-        and x["breakout_pct"] >= -0.15
+        and 0.5 <= x["move_5m"] <= 5.0
+        and x["breakout_pct"] >= -0.10
         and x["recent_quote_volume_3m"] >= MIN_RECENT_3M_QUOTE_VOLUME
         and x.get("trend_up", False)
         and x.get("trend_quality", 0) >= MIN_TREND_QUALITY
         and x.get("breakout_hold", 0) >= 2
     )
     if confirmed:
-        return "BUY_NOW", "The breakout held across repeated scans with sustained buying pressure."
+        return "BUY_NOW", "Breakout held across repeated scans with sustained participation and buyer pressure."
 
     speculative = (
         not context.get("risk_off")
         and hits >= DECISION_CONFIRM_SCANS
-        and x["score"] >= SPEC_SCORE + bias
+        and x["score"] >= SPEC_SCORE + bias - analog * 0.25
         and x["volume_ratio"] >= 2.8
         and x["volume_accel"] >= 1.6
         and x["trade_accel"] >= 1.20
@@ -1045,12 +1323,11 @@ def decide_action(x, context):
         and x.get("extension_pct", 99) <= 2.0
     )
     if speculative:
-        return "SPEC_BUY", "Strong early accumulation persisted before a full breakout."
+        return "SPEC_BUY", "Strong early accumulation persisted, but the setup remains higher risk."
 
     if x["score"] >= WATCH_SCORE and x["recent_quote_volume_3m"] >= MIN_RECENT_3M_QUOTE_VOLUME:
-        return "WATCH", "Interesting, but not strong enough for an entry yet."
+        return "WATCH", "Interesting, but evidence is not strong enough for an entry."
     return "NONE", "No actionable edge right now."
-
 
 def should_notify(symbol, action):
     prev = last_action.get(symbol)
@@ -1072,32 +1349,266 @@ def buy_keyboard(symbol, price):
 
 def action_message(action, x, plan):
     base = base_symbol(x["symbol"])
-    variant = sum(ord(c) for c in base) % 3
-    if action == "BUY_NOW":
-        phrases = [
-            "Setup confirmed. Buy near {e} • Stop {s} • Target {t}.",
-            "This one has confirmed. Enter near {e} • Stop {s} • Target {t}.",
-            "Momentum confirmed. Entry around {e} • Stop {s} • Target {t}.",
-        ]
-        line = phrases[variant].format(
-            e=f"{plan['entry_price']:.8g}", s=f"{plan['stop_price']:.8g}", t=f"{plan['target_price']:.8g}"
-        )
-        return f"🟢 BUY NOW — {base}\n{line}"
-    if action == "SPEC_BUY":
-        phrases = [
-            "Early setup is strong. Small entry near {e} • Stop {s} • Target {t}.",
-            "Higher-risk early entry. Keep it small near {e} • Stop {s} • Target {t}.",
-            "Early momentum is holding. Small entry ~{e} • Stop {s} • Target {t}.",
-        ]
-        line = phrases[variant].format(
-            e=f"{plan['entry_price']:.8g}", s=f"{plan['stop_price']:.8g}", t=f"{plan['target_price']:.8g}"
-        )
-        return f"⚡ SPECULATIVE BUY — {base}\n{line}"
     if action == "SKIP_FEES":
-        return f"🔴 SKIP — {base}\nThe setup is good, but your current fee mode makes the trade poor value."
+        return f"🔴 SKIP — {base}\nThe setup qualified, but costs make the trade poor value."
     if action == "AVOID_CHASE":
-        return f"🔴 DON'T CHASE — {base}\nIt's already stretched. Wait for a reset instead."
+        return f"🔴 DON'T CHASE — {base}\nThe move is already stretched. Wait for a new setup."
     return ""
+
+
+# ---------------- V2.3 SETUP LIFECYCLE ----------------
+
+def active_setup_for(symbol):
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            row = con.execute(
+                """
+                SELECT setup_id,symbol,setup_type,created_ts,updated_ts,state,entry_price,
+                       stop_price,target_price,score,reason,expires_ts,trigger_ts,details
+                FROM active_setups
+                WHERE symbol=? AND state='PENDING'
+                ORDER BY setup_id DESC LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+        if not row:
+            return None
+        keys = ["setup_id","symbol","setup_type","created_ts","updated_ts","state","entry_price",
+                "stop_price","target_price","score","reason","expires_ts","trigger_ts","details"]
+        out = dict(zip(keys, row))
+        try:
+            out["details"] = json.loads(out.get("details") or "{}")
+        except Exception:
+            out["details"] = {}
+        return out
+    except Exception as exc:
+        print("Active setup lookup error:", exc)
+        return None
+
+
+def pending_setup_symbols():
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            return [r[0] for r in con.execute("SELECT DISTINCT symbol FROM active_setups WHERE state='PENDING'").fetchall()]
+    except Exception:
+        return []
+
+
+def _set_setup_state(setup_id, state, trigger_ts=None):
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "UPDATE active_setups SET state=?,updated_ts=?,trigger_ts=COALESCE(?,trigger_ts) WHERE setup_id=?",
+                (state, time.time(), trigger_ts, setup_id),
+            )
+    except Exception as exc:
+        print("Setup state error:", exc)
+
+
+def build_setup_plan(x, action):
+    plan = trade_plan(x, "SPEC_BUY" if action == "SPEC_BUY" else "BUY_NOW")
+    # For pre-breakouts, the desired entry is a small confirmation above the
+    # resistance that existed when the setup was detected—not the current quote.
+    if action == "PRE_BREAKOUT":
+        entry = x["previous_high"] * 1.0015
+        stop_pct = 0.06
+        target_pct = 0.22
+        plan["entry_price"] = entry
+        plan["stop_pct"] = stop_pct
+        plan["target_pct"] = target_pct
+        plan["stop_price"] = entry * (1 - stop_pct)
+        plan["target_price"] = entry * (1 + target_pct)
+    return plan
+
+
+def create_or_get_setup(x, action, plan, reason):
+    symbol = x["symbol"]
+    existing = active_setup_for(symbol)
+    if existing:
+        return existing, False
+    now = time.time()
+    details = {"signal": x, "initial_action": action, "plan": plan}
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.execute(
+                """
+                INSERT INTO active_setups(
+                    symbol,setup_type,created_ts,updated_ts,state,entry_price,stop_price,
+                    target_price,score,reason,expires_ts,details
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    symbol, action, now, now, "PENDING", plan["entry_price"], plan["stop_price"],
+                    plan["target_price"], x.get("score", 0), reason, now + SETUP_TTL,
+                    json.dumps(details),
+                ),
+            )
+            setup_id = cur.lastrowid
+        return active_setup_for(symbol), True
+    except Exception as exc:
+        print("Create setup error:", exc)
+        return None, False
+
+
+def setup_arm_message(setup):
+    base = base_symbol(setup["symbol"])
+    entry = setup["entry_price"]
+    if setup["setup_type"] == "PRE_BREAKOUT":
+        return (
+            f"🚀 PRE-BREAKOUT SETUP — {base}\n"
+            f"Watching ~{entry:.8g}. I’ll send ENTER NOW only if the breakout confirms."
+        )
+    label = "speculative" if setup["setup_type"] == "SPEC_BUY" else "confirmed"
+    return (
+        f"🎯 SETUP ARMED — {base}\n"
+        f"{label.capitalize()} setup near {entry:.8g}. Waiting for a clean live entry."
+    )
+
+
+def _trigger_quality(x, setup, context):
+    if context.get("risk_off") and setup["setup_type"] != "BUY_NOW":
+        return False, "Market conditions turned risk-off."
+    if x.get("false_breakout") or x.get("wick_rejection"):
+        return False, "The breakout was rejected."
+    if x.get("buy_ratio", 0) < 0.56 or x.get("buy_ratio_10m", 0) < 0.52:
+        return False, "Buyer pressure faded at the entry."
+    if x.get("volume_ratio", 0) < 1.55 or x.get("trade_accel", 0) < 0.95:
+        return False, "Participation faded at the entry."
+    if x.get("recent_quote_volume_3m", 0) < MIN_RECENT_3M_QUOTE_VOLUME:
+        return False, "Liquidity is too weak at the entry."
+    if x.get("move_1m", 0) <= -1.4:
+        return False, "Price is falling into the entry instead of confirming."
+    if x.get("extension_pct", 0) > MAX_ENTRY_EXTENSION_PCT:
+        return False, "Price became too extended."
+    return True, "Entry reached with volume, buyer pressure and structure still intact."
+
+
+def cancel_setup(setup, reason, state="CANCELLED", notify=True):
+    _set_setup_state(setup["setup_id"], state)
+    last_reason[setup["symbol"]] = reason
+    if notify:
+        base = base_symbol(setup["symbol"])
+        title = "⛔ DON'T CHASE" if state == "MISSED" else "❌ SETUP CANCELLED"
+        telegram_once(
+            f"setup:{setup['setup_id']}:{state}",
+            f"{title} — {base}\n{reason}",
+        )
+
+
+def evaluate_pending_setup(setup, x, context):
+    if not setup or setup.get("state") != "PENDING":
+        return
+    now = time.time()
+    symbol = setup["symbol"]
+    price = x["price"]
+    entry = setup["entry_price"]
+
+    if setup.get("expires_ts") and now >= setup["expires_ts"]:
+        cancel_setup(setup, "No clean entry appeared before the setup expired.", state="EXPIRED", notify=False)
+        return
+    if price <= (setup.get("stop_price") or 0):
+        cancel_setup(setup, "Price invalidated the setup before entry.")
+        return
+    if price > entry * (1 + MAX_TRIGGER_OVERSHOOT_PCT / 100.0):
+        cancel_setup(setup, "The planned entry was missed and price ran too far. Wait for a reset.", state="MISSED")
+        return
+
+    low = entry * (1 - ENTRY_ZONE_PCT / 100.0)
+    high = entry * (1 + MAX_TRIGGER_OVERSHOOT_PCT / 100.0)
+    if not (low <= price <= high):
+        return
+
+    ok, reason = _trigger_quality(x, setup, context)
+    if not ok:
+        # A single weak scan at the zone is not always fatal. Hard rejection is.
+        if x.get("false_breakout") or x.get("wick_rejection") or x.get("buy_ratio", 0) < 0.48:
+            cancel_setup(setup, reason)
+        return
+
+    # Re-check material catalysts only at the moment real money would be considered.
+    news = get_candidate_news(base_symbol(symbol)) if ENABLE_NEWS else []
+    serious_negative = [item for item in news if item.get("score", 0) <= -3]
+    if serious_negative:
+        cancel_setup(setup, "A material negative catalyst appeared before entry.")
+        return
+
+    action = "SPEC_BUY" if setup["setup_type"] == "SPEC_BUY" else "BUY_NOW"
+    plan = {
+        "entry_price": entry,
+        "stop_price": setup["stop_price"],
+        "target_price": setup["target_price"],
+        "sensible": True,
+    }
+    _set_setup_state(setup["setup_id"], "TRIGGERED", trigger_ts=now)
+    last_reason[symbol] = reason
+    save_signal_state(symbol, "ENTER_NOW", reason, price)
+    record_signal_event(symbol, action, x, plan, reason)
+    telegram_once(
+        f"setup:{setup['setup_id']}:TRIGGERED",
+        (
+            f"🚨 ENTER NOW — {base_symbol(symbol)}\n"
+            f"Entry confirmed near {entry:.8g} • Stop {setup['stop_price']:.8g} • "
+            f"Target {setup['target_price']:.8g}."
+        ),
+        reply_markup=buy_keyboard(symbol, entry),
+    )
+    log_alert(symbol, "ENTER_NOW", price, x.get("score"), {"reason": reason, "setup_id": setup["setup_id"]})
+
+
+def process_setup_candidate(x, action, context, reason):
+    plan = build_setup_plan(x, action)
+    if not plan.get("sensible", False):
+        if should_notify(x["symbol"], "SKIP_FEES"):
+            event_window = int(time.time() // ACTION_COOLDOWN)
+            telegram_once(
+                f"skipfees:{x['symbol']}:{event_window}",
+                action_message("SKIP_FEES", x, plan),
+            )
+            save_signal_state(x["symbol"], "SKIP_FEES", reason, x["price"])
+        return
+
+    # Material negative catalysts veto the setup before it is armed.
+    news = get_candidate_news(base_symbol(x["symbol"])) if ENABLE_NEWS else []
+    if any(item.get("score", 0) <= -3 for item in news):
+        event_window = int(time.time() // ACTION_COOLDOWN)
+        telegram_once(
+            f"news-veto:{x['symbol']}:{event_window}",
+            f"🔴 SKIP — {base_symbol(x['symbol'])}\nA material negative catalyst conflicts with the setup.",
+        )
+        save_signal_state(x["symbol"], "AVOID_NEWS", "Material negative catalyst veto.", x["price"])
+        return
+
+    setup, created = create_or_get_setup(x, action, plan, reason)
+    if not setup:
+        return
+    if created:
+        # Audit pre-breakout ideas even if they never trigger.
+        if action == "PRE_BREAKOUT":
+            record_signal_event(x["symbol"], "PRE_BREAKOUT", x, plan, reason)
+        save_signal_state(x["symbol"], "SETUP_PENDING", reason, x["price"])
+
+    # If the entry is already live, send only ENTER NOW; otherwise arm once.
+    before_state = setup.get("state")
+    evaluate_pending_setup(setup, x, context)
+    refreshed = active_setup_for(x["symbol"])
+    if created and refreshed and refreshed.get("state") == "PENDING" and before_state == "PENDING":
+        telegram_once(f"setup:{setup['setup_id']}:ARMED", setup_arm_message(setup))
+
+def setup_cooldown_active(symbol):
+    """Do not create a fresh setup immediately after the previous one terminated."""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            row = con.execute(
+                """
+                SELECT state,updated_ts FROM active_setups
+                WHERE symbol=? AND state IN ('TRIGGERED','CANCELLED','MISSED','EXPIRED')
+                ORDER BY setup_id DESC LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+        return bool(row and time.time() - (row[1] or 0) < ACTION_COOLDOWN)
+    except Exception:
+        return False
 
 
 # ---------------- USER PORTFOLIO / DIRECT EXIT MANAGEMENT ----------------
@@ -1133,6 +1644,9 @@ def add_user_position(symbol, entry, quantity=0.0, stop=None, target=None):
     symbol = normalize_crypto_symbol(symbol)
     if not symbol:
         return False, "I couldn't read that symbol."
+    existing = tracked.get(symbol)
+    if existing and existing.get("status") == "OPEN":
+        return True, f"✅ {base_symbol(symbol)} is already being tracked. I won't create a duplicate position."
     if not is_live_crypto_symbol(symbol):
         return False, f"I don't have a live market feed for {base_symbol(symbol)} yet."
 
@@ -1237,6 +1751,29 @@ def command_reason(symbol):
     return f"💬 {base_symbol(symbol)}: {reason}"
 
 
+def setups_message():
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            rows = con.execute(
+                """
+                SELECT symbol,setup_type,entry_price,expires_ts
+                FROM active_setups WHERE state='PENDING'
+                ORDER BY created_ts DESC LIMIT 12
+                """
+            ).fetchall()
+        if not rows:
+            return "🎯 No pending entry setups right now."
+        now = time.time()
+        lines = ["🎯 PENDING SETUPS"]
+        for symbol, setup_type, entry, expires in rows:
+            mins = max(0, int(((expires or now) - now) / 60))
+            label = "PRE" if setup_type == "PRE_BREAKOUT" else ("SPEC" if setup_type == "SPEC_BUY" else "BUY")
+            lines.append(f"{base_symbol(symbol)} • {label} • entry ~{entry:.8g} • {mins}m left")
+        return "\n".join(lines)
+    except Exception:
+        return "🎯 Pending setup data isn't available right now."
+
+
 def handle_text_command(text, chat_id):
     raw = (text or "").strip()
     low = raw.lower()
@@ -1245,14 +1782,20 @@ def handle_text_command(text, chat_id):
         telegram(portfolio_message(), chat_id=chat_id)
         return
     if low in ("/status", "status"):
-        telegram(f"🟢 Scanner V{VERSION} active. Tracking {len(tracked)} open position(s).", chat_id=chat_id)
+        telegram(
+            f"🟢 Scanner V{VERSION} active. Tracking {len(tracked)} open position(s) and {len(pending_setup_symbols())} pending setup(s).",
+            chat_id=chat_id,
+        )
+        return
+    if low in ("/setups", "setups", "pending setups"):
+        telegram(setups_message(), chat_id=chat_id)
         return
     if low in ("/learning", "learning"):
         telegram(learning_summary(), chat_id=chat_id)
         return
     if low in ("/help", "help"):
         telegram(
-            "Commands: /bought SOL 150.20 0.30 • /sold SOL • /portfolio • /why SOL • /learning",
+            "Commands: /setups • /bought SOL 150.20 0.30 • /sold SOL • /portfolio • /why SOL • /learning",
             chat_id=chat_id,
         )
         return
@@ -1328,8 +1871,12 @@ def poll_telegram_updates():
             print("Telegram getUpdates error:", r.status_code, r.text[:160])
             return
         for update in r.json().get("result", []):
-            update_id = update.get("update_id", 0)
+            update_id = int(update.get("update_id", 0))
+            # Advance the remote offset even when this exact update was already handled.
             set_meta("telegram_offset", update_id + 1)
+            if not _claim_telegram_update(update_id):
+                print("[TELEGRAM UPDATE DEDUPE]", update_id)
+                continue
             if "callback_query" in update:
                 handle_callback(update["callback_query"])
                 continue
@@ -1342,9 +1889,6 @@ def poll_telegram_updates():
                 handle_text_command(text, chat_id)
     except Exception as exc:
         print("Telegram polling error:", exc)
-
-
-# ---------------- VERIFIED SEC INSIDER PURCHASE/SALE MODULE ----------------
 
 def sec_headers():
     # SEC requests should identify the automated client with a real contact.
@@ -1521,10 +2065,23 @@ def scan_sec_insiders():
 
 def process_candidate(x, context):
     symbol = x["symbol"]
+
+    # A live setup owns this symbol until it triggers/cancels/expires. This is the
+    # architectural duplicate fix: repeated scans cannot create repeated BUY alerts.
+    existing = active_setup_for(symbol)
+    if existing:
+        evaluate_pending_setup(existing, x, context)
+        if active_setup_for(symbol):
+            return
+
+    # A just-triggered/cancelled setup cannot immediately recreate itself on the
+    # next candidate pass. This is the hard duplicate/cooldown boundary.
+    if setup_cooldown_active(symbol):
+        return
+
     action, reason = decide_action(x, context)
     last_reason[symbol] = reason
 
-    # Watches are intentionally silent. They are stored only for later auditing.
     if action == "WATCH":
         record_signal_event(symbol, "WATCH", x, reason=reason)
         return
@@ -1533,42 +2090,31 @@ def process_candidate(x, context):
 
     if action == "AVOID_CHASE":
         if should_notify(symbol, action):
-            telegram(action_message(action, x, {}))
+            window = int(time.time() // ACTION_COOLDOWN)
+            telegram_once(f"avoid:{symbol}:{window}", action_message(action, x, {}))
             save_signal_state(symbol, action, reason, x["price"])
             log_alert(symbol, action, x["price"], x["score"], {"reason": reason})
         return
 
-    # Only now spend a news request, after the market setup has already qualified.
-    news = get_candidate_news(base_symbol(symbol)) if ENABLE_NEWS else []
-    if news and min(item["score"] for item in news) <= -2:
-        reason = "A material negative catalyst was detected, so the entry was cancelled."
-        if should_notify(symbol, "AVOID_NEWS"):
-            telegram(f"🔴 SKIP — {base_symbol(symbol)}\nA serious negative catalyst just appeared. Don't enter now.")
-            save_signal_state(symbol, "AVOID_NEWS", reason, x["price"])
-        return
-
-    plan = trade_plan(x, action)
-    record_signal_event(symbol, action, x, plan, reason)
-
-    if not plan["sensible"]:
-        action = "SKIP_FEES"
-        reason = "The market setup qualified, but the configured fees and position size destroy the risk/reward."
-
-    if should_notify(symbol, action):
-        telegram(
-            action_message(action, x, plan),
-            reply_markup=buy_keyboard(symbol, plan["entry_price"]) if action in ("BUY_NOW", "SPEC_BUY") else None,
-        )
-        save_signal_state(symbol, action, reason, x["price"])
-        log_alert(symbol, action, x["price"], x["score"], {"reason": reason, "plan": plan})
+    if action in ("PRE_BREAKOUT", "BUY_NOW", "SPEC_BUY"):
+        process_setup_candidate(x, action, context, reason)
 
 
 def scan():
     global scan_number
     all_symbols = get_symbols()
     symbols = select_symbols_for_scan(all_symbols)
+
+    # Pending entries and owned positions are never allowed to fall out of the
+    # rotating universe while the bot is responsible for following them.
+    must_scan = list(dict.fromkeys(pending_setup_symbols() + [s for s, p in tracked.items() if p.get("status") == "OPEN"]))
+    symbols = list(dict.fromkeys(symbols + must_scan))
+
     scan_number += 1
-    print(f"[{utc_now()}] Scanning {len(symbols)} markets ({len(all_symbols)} eligible)...")
+    print(
+        f"[{utc_now()}] Scanning {len(symbols)} markets ({len(all_symbols)} eligible) • "
+        f"{len(pending_setup_symbols())} pending setups..."
+    )
 
     results = []
     for symbol in symbols:
@@ -1583,21 +2129,13 @@ def scan():
         except Exception as exc:
             print(symbol, exc)
 
-    # User-owned positions always get checked, even outside the rotating universe.
     by_symbol = {x["symbol"]: x for x in results}
+
+    # User-owned position management remains highest priority.
     for symbol in list(tracked.keys()):
         if tracked[symbol].get("status") != "OPEN":
             continue
         x = by_symbol.get(symbol)
-        if not x:
-            try:
-                x = analyse(symbol)
-                if x:
-                    by_symbol[symbol] = x
-                    results.append(x)
-                    last_prices[symbol] = x["price"]
-            except Exception as exc:
-                print("Tracked update error", symbol, exc)
         if x:
             update_position(x)
 
@@ -1606,10 +2144,32 @@ def scan():
     price_map = {x["symbol"]: x["price"] for x in results}
     update_signal_outcomes(price_map)
 
-    # Strongest first, but Telegram remains silent unless an actionable state is reached.
-    candidates = [x for x in results if x["score"] >= WATCH_SCORE or x["rapid_move"]]
-    candidates.sort(key=lambda x: (x["score"], x["volume_ratio"], x["buy_ratio"]), reverse=True)
-    for x in candidates[:18]:
+    # First update already-armed setups. A setup can produce only one ENTER NOW,
+    # CANCELLED or DON'T CHASE event because each lifecycle event has a persistent key.
+    for symbol in pending_setup_symbols():
+        x = by_symbol.get(symbol)
+        setup = active_setup_for(symbol)
+        if x and setup:
+            evaluate_pending_setup(setup, x, context)
+
+    # Then look for new opportunities. PRE_BREAKOUT patterns are eligible even
+    # before the ordinary breakout score reaches WATCH_SCORE.
+    candidates = [
+        x for x in results
+        if x["score"] >= WATCH_SCORE
+        or x.get("prebreakout_score", 0) >= PREBREAKOUT_SCORE - 0.4
+        or x["rapid_move"]
+    ]
+    candidates.sort(
+        key=lambda x: (
+            max(x.get("score", 0), x.get("prebreakout_score", 0)),
+            x.get("activity_leads_price", False),
+            x["volume_ratio"],
+            x["buy_ratio"],
+        ),
+        reverse=True,
+    )
+    for x in candidates[:24]:
         process_candidate(x, context)
 
     scan_sec_insiders()
@@ -1633,13 +2193,13 @@ def main():
 
     telegram(
         f"🟢 Armin Market Scanner V{VERSION} ONLINE\n"
-        "Stricter confirmation, anti-chase and duplicate protection are active."
+        "Pre-breakout detection, entry follow-ups and hard event deduplication are active."
     )
 
     if ENABLE_SEC and not SEC_USER_AGENT:
         print("SEC scanner disabled until SEC_USER_AGENT is configured.")
 
-    # V2.2: bot interaction no longer waits for a full market scan.
+    # V2.3: bot interaction remains independent from the market scan.
     threading.Thread(target=telegram_poll_loop, name="telegram-poller", daemon=True).start()
 
     while True:
