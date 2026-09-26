@@ -5,6 +5,8 @@ import json
 import math
 import sqlite3
 import statistics
+import threading
+import hashlib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, urljoin
@@ -12,12 +14,12 @@ from urllib.parse import quote_plus, urljoin
 import requests
 
 # ============================================================
-# ARMIN MARKET SCANNER V2.1
+# ARMIN MARKET SCANNER V2.2
 # Quiet, action-first, stateful, interactive and self-auditing.
 # Alert-only: it does NOT place real orders.
 # ============================================================
 
-VERSION = "2.1"
+VERSION = "2.2"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -85,7 +87,7 @@ GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
 SEC_CURRENT = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Armin-Market-Scanner/2.1"})
+session.headers.update({"User-Agent": "Armin-Market-Scanner/2.2"})
 
 last_alert = {}
 news_cache = {}
@@ -100,11 +102,39 @@ last_sec_scan = 0
 seen_sec_filings = set()
 scan_number = 0
 
-DB_PATH = os.getenv("DB_PATH", "scanner_v21.db")
+DB_PATH = os.getenv("DB_PATH", "scanner_v22.db")
+
+# V2.2 reliability / intelligence
+TELEGRAM_POLL_EVERY = float(os.getenv("TELEGRAM_POLL_EVERY", "2"))
+MESSAGE_DEDUPE_SECONDS = int(os.getenv("MESSAGE_DEDUPE_SECONDS", str(6 * 60 * 60)))
+MAX_ENTRY_EXTENSION_PCT = float(os.getenv("MAX_ENTRY_EXTENSION_PCT", "3.0"))
+MAX_15M_ENTRY_MOVE_PCT = float(os.getenv("MAX_15M_ENTRY_MOVE_PCT", "7.0"))
+MIN_TREND_QUALITY = float(os.getenv("MIN_TREND_QUALITY", "0.58"))
+telegram_poll_lock = threading.Lock()
+telegram_send_lock = threading.Lock()
+recent_message_hashes = {}
 
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _message_fingerprint(message):
+    # Exact-message idempotency. Prevents accidental repeated Telegram sends in one runtime.
+    return hashlib.sha256((str(CHAT_ID) + "|" + message.strip()).encode("utf-8")).hexdigest()
+
+
+def _message_is_duplicate(message):
+    now = time.time()
+    fp = _message_fingerprint(message)
+    # prune old hashes
+    for key, ts in list(recent_message_hashes.items()):
+        if now - ts > MESSAGE_DEDUPE_SECONDS:
+            recent_message_hashes.pop(key, None)
+    if now - recent_message_hashes.get(fp, 0) < MESSAGE_DEDUPE_SECONDS:
+        return True
+    recent_message_hashes[fp] = now
+    return False
 
 
 def _ensure_column(con, table, name, ddl):
@@ -311,6 +341,12 @@ def telegram(message, reply_markup=None, chat_id=None):
         print(message)
         return False
 
+    # V2.2 exact-message idempotency: one identical message per dedupe window.
+    with telegram_send_lock:
+        if _message_is_duplicate(message):
+            print("[TELEGRAM DEDUPE]", message.splitlines()[0][:100])
+            return False
+
     payload = {"chat_id": target, "text": message}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -510,7 +546,7 @@ def select_symbols_for_scan(symbols):
     width = min(ROTATING_SYMBOLS, len(rest))
     if width <= 0:
         return core
-    start = (scan_number * width) % len(rest)
+  start = (scan_number * width) % len(rest)
     rotation = [rest[(start + i) % len(rest)] for i in range(width)]
     return list(dict.fromkeys(core + rotation))
 
@@ -580,6 +616,22 @@ def analyse(symbol):
     recent_range = (recent10_high - recent10_low) / max(recent10_low, 1e-12)
     compression = recent_range < prior_range * 0.75 if prior_range > 0 else False
 
+    # V2.2 pattern-quality features from the same 1m feed (no extra API latency).
+    ema9 = safe_mean(closes[-9:])
+    ema21 = safe_mean(closes[-21:])
+    trend_up = price > ema9 > ema21
+    extension_pct = pct(price, ema21)
+    green_recent = sum(1 for i in range(-6, 0) if closes[i] >= float(candles[i][1]))
+    trend_quality = green_recent / 6.0
+    breakout_hold = sum(1 for c in closes[-3:] if c >= previous_high * 0.998)
+    last_open = float(candles[-1][1])
+    last_high = highs[-1]
+    last_low = lows[-1]
+    body = abs(price - last_open)
+    upper_wick = max(0.0, last_high - max(price, last_open))
+    wick_rejection = body > 0 and upper_wick > body * 1.8
+    false_breakout = last_high > previous_high and price < previous_high * 0.997
+
     score = 0.0
     if volume_ratio >= 1.8: score += 1
     if volume_ratio >= 3.0: score += 1
@@ -601,6 +653,12 @@ def analyse(symbol):
         score -= 1.0
     if recent_quote_volume_3m < MIN_RECENT_3M_QUOTE_VOLUME:
         score -= 1.0
+    if trend_up: score += 0.75
+    if breakout_hold >= 2: score += 0.75
+    if trend_quality >= 0.66: score += 0.5
+    if wick_rejection: score -= 1.25
+    if false_breakout: score -= 2.0
+    if extension_pct > MAX_ENTRY_EXTENSION_PCT: score -= 1.5
 
     rapid_move = move_5m >= 8.0 or move_3m >= 6.0
 
@@ -612,6 +670,9 @@ def analyse(symbol):
         "move_15m": move_15m, "previous_high": previous_high,
         "previous_low": previous_low, "breakout_pct": breakout_pct,
         "compression": compression, "score": score, "rapid_move": rapid_move,
+        "trend_up": trend_up, "trend_quality": trend_quality,
+        "breakout_hold": breakout_hold, "extension_pct": extension_pct,
+        "wick_rejection": wick_rejection, "false_breakout": false_breakout,
     }
 
 
@@ -922,15 +983,29 @@ def update_candidate_memory(x):
 
 def market_context(results):
     btc = next((x for x in results if x["symbol"] == "BTCUSDT"), None)
-    if not btc:
-        return {"risk_off": False, "btc_15m": 0.0}
-    return {"risk_off": btc["move_15m"] <= -1.8, "btc_15m": btc["move_15m"]}
+    advancers = sum(1 for x in results if x.get("move_15m", 0) > 0)
+    breadth = advancers / max(len(results), 1)
+    btc15 = btc["move_15m"] if btc else 0.0
+    return {
+        "risk_off": btc15 <= -1.8 or breadth < 0.30,
+        "overheated": breadth > 0.82 and btc15 > 2.5,
+        "btc_15m": btc15,
+        "breadth": breadth,
+    }
 
 
 def decide_action(x, context):
     hits = update_candidate_memory(x)
     bias = context.get("learning_bias", 0.0)
-    risk_penalty = 0.50 if context.get("risk_off") and x["symbol"] not in ("BTCUSDT", "ETHUSDT") else 0.0
+    risk_penalty = 0.75 if context.get("risk_off") and x["symbol"] not in ("BTCUSDT", "ETHUSDT") else 0.0
+
+    # V2.2 hard quality gates: reject false breakouts, exhaustion and poor structure.
+    if x.get("false_breakout") or x.get("wick_rejection"):
+        return "NONE", "Rejected: price showed breakout rejection rather than clean continuation."
+    if x.get("extension_pct", 0) > MAX_ENTRY_EXTENSION_PCT or x.get("move_15m", 0) > MAX_15M_ENTRY_MOVE_PCT:
+        return "AVOID_CHASE", "Rejected: the move is too extended for a fresh entry."
+    if context.get("overheated") and x.get("move_5m", 0) > 3.5:
+        return "NONE", "Market-wide momentum is overheated; waiting instead of chasing."
 
     # Extended pumps are not entries. Weak buyer control makes them especially dangerous.
     if x["rapid_move"]:
@@ -948,6 +1023,9 @@ def decide_action(x, context):
         and 0.5 <= x["move_5m"] <= 5.5
         and x["breakout_pct"] >= -0.15
         and x["recent_quote_volume_3m"] >= MIN_RECENT_3M_QUOTE_VOLUME
+        and x.get("trend_up", False)
+        and x.get("trend_quality", 0) >= MIN_TREND_QUALITY
+        and x.get("breakout_hold", 0) >= 2
     )
     if confirmed:
         return "BUY_NOW", "The breakout held across repeated scans with sustained buying pressure."
@@ -962,6 +1040,9 @@ def decide_action(x, context):
         and x["buy_ratio"] >= 0.68
         and -0.2 <= x["move_5m"] <= 2.8
         and x["recent_quote_volume_3m"] >= MIN_RECENT_3M_QUOTE_VOLUME
+        and x.get("trend_up", False)
+        and x.get("trend_quality", 0) >= 0.66
+        and x.get("extension_pct", 99) <= 2.0
     )
     if speculative:
         return "SPEC_BUY", "Strong early accumulation persisted before a full breakout."
@@ -1459,8 +1540,8 @@ def process_candidate(x, context):
 
     # Only now spend a news request, after the market setup has already qualified.
     news = get_candidate_news(base_symbol(symbol)) if ENABLE_NEWS else []
-    if news and min(item["score"] for item in news) <= -4:
-        reason = "A severe negative catalyst was detected, so the entry was cancelled."
+    if news and min(item["score"] for item in news) <= -2:
+        reason = "A material negative catalyst was detected, so the entry was cancelled."
         if should_notify(symbol, "AVOID_NEWS"):
             telegram(f"🔴 SKIP — {base_symbol(symbol)}\nA serious negative catalyst just appeared. Don't enter now.")
             save_signal_state(symbol, "AVOID_NEWS", reason, x["price"])
@@ -1532,7 +1613,17 @@ def scan():
         process_candidate(x, context)
 
     scan_sec_insiders()
-    poll_telegram_updates()
+
+
+def telegram_poll_loop():
+    # Telegram is independent from the market scan, so commands/buttons respond quickly.
+    while True:
+        try:
+            with telegram_poll_lock:
+                poll_telegram_updates()
+        except Exception as exc:
+            print("Telegram background poll error:", exc)
+        time.sleep(max(0.5, TELEGRAM_POLL_EVERY))
 
 
 def main():
@@ -1542,14 +1633,14 @@ def main():
 
     telegram(
         f"🟢 Armin Market Scanner V{VERSION} ONLINE\n"
-        "Quiet mode is on. I'll message only when there's an action worth taking."
+        "Stricter confirmation, anti-chase and duplicate protection are active."
     )
 
     if ENABLE_SEC and not SEC_USER_AGENT:
         print("SEC scanner disabled until SEC_USER_AGENT is configured.")
 
-    # Pull old bot commands once at startup so interaction works immediately.
-    poll_telegram_updates()
+    # V2.2: bot interaction no longer waits for a full market scan.
+    threading.Thread(target=telegram_poll_loop, name="telegram-poller", daemon=True).start()
 
     while True:
         started = time.time()
@@ -1565,3 +1656,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                              
