@@ -39,7 +39,6 @@ ENABLE_SEC = os.getenv("ENABLE_SEC", "false").lower() == "true"
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "").strip()
 SEC_SCAN_EVERY = int(os.getenv("SEC_SCAN_EVERY", "600"))
 
-# Binance public market-data endpoints, in automatic failover order.
 BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision",
     "https://api-gcp.binance.com",
@@ -174,57 +173,44 @@ def request_json(url, params=None, timeout=12, headers=None):
     return r.json()
 
 
-
 def binance_json(path, params=None, timeout=12):
-    """Fetch public Binance market data with automatic endpoint failover."""
     global active_binance, last_feed_warning
 
-    endpoints = []
-    if active_binance in BINANCE_ENDPOINTS:
-        endpoints.append(active_binance)
-    endpoints.extend(ep for ep in BINANCE_ENDPOINTS if ep not in endpoints)
+    endpoints = list(BINANCE_ENDPOINTS)
+    if active_binance in endpoints:
+        endpoints.remove(active_binance)
+        endpoints.insert(0, active_binance)
 
-    errors = []
     previous = active_binance
+    last_error = None
 
     for endpoint in endpoints:
         try:
             r = session.get(endpoint + path, params=params, timeout=timeout)
-
             if r.status_code in (418, 429):
-                errors.append(f"{endpoint}: HTTP {r.status_code}")
-                print(f"[MARKET FEED] {endpoint} rate-limited; trying backup")
+                print(f"[MARKET FEED] {endpoint} rate limited ({r.status_code}); trying backup.")
+                last_error = RuntimeError(f"HTTP {r.status_code}")
                 continue
-
             r.raise_for_status()
             data = r.json()
 
             if active_binance != endpoint:
                 active_binance = endpoint
                 print(f"[MARKET FEED] Binance endpoint active: {endpoint}")
-                if previous and previous != endpoint:
-                    telegram(
-                        "🟢 MARKET FEED RECOVERED\n"
-                        f"Switched Binance public data feed to {endpoint}."
-                    )
+                if previous is not None and previous != endpoint:
+                    telegram(f"🟢 MARKET FEED RECOVERED\nUsing {endpoint}")
             return data
-
         except (requests.RequestException, ValueError) as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
-            label = f"HTTP {status}" if status else exc.__class__.__name__
-            errors.append(f"{endpoint}: {label}")
-            print(f"[MARKET FEED] {endpoint} failed: {label}")
+            print(f"[MARKET FEED] {endpoint} failed" + (f" ({status})" if status else "") + f": {exc}")
+            last_error = exc
 
     now = time.time()
-    if now - last_feed_warning > FEED_WARNING_COOLDOWN:
-        telegram(
-            "🔴 MARKET DATA OFFLINE\n"
-            "All configured Binance public-data endpoints failed. "
-            "Crypto scanning is temporarily unavailable; automatic retries will continue."
-        )
+    if now - last_feed_warning >= FEED_WARNING_COOLDOWN:
+        telegram("🔴 MARKET DATA OFFLINE\nAll configured Binance public-data endpoints failed. Scanner will keep retrying.")
         last_feed_warning = now
+    raise RuntimeError(f"All Binance market-data endpoints failed: {last_error}")
 
-    raise RuntimeError("All Binance endpoints failed: " + "; ".join(errors))
 
 def get_symbols():
     data = binance_json("/api/v3/ticker/24hr", timeout=20)
@@ -657,4 +643,348 @@ def update_position(x):
         return
 
     # Momentum failure even before hard stop.
-    
+    if (
+        x["move_3m"] <= -2.2
+        and x["buy_ratio"] < 0.43
+        and x["volume_ratio"] >= 1.8
+        and gain > -3
+    ):
+        msg = (
+            f"🔴 EXIT ALL — {base}\n"
+            f"Price {price:.8g} | from entry {gain:+.1f}%\n"
+            f"Reason: strong sell pressure + momentum failure."
+        )
+        telegram(msg)
+        log_alert(symbol, "EXIT_ALL", price, x["score"], {"gain_pct": gain})
+        p["status"] = "CLOSED"
+        save_position(symbol, p)
+        return
+
+    # Partial profit only once.
+    weakening = x["buy_ratio"] < 0.52 or x["move_1m"] < -1.0 or drawdown_from_high <= -5.0
+
+    if gain >= 18 and weakening and not p["partial_taken"]:
+        msg = (
+            f"🟠 SELL / TAKE PROFIT — {base}\n"
+            f"Take ~50% | price {price:.8g} | gain {gain:+.1f}%\n"
+            f"Reason: strong gain, momentum now weakening."
+        )
+        telegram(msg)
+        log_alert(symbol, "TAKE_PROFIT_50", price, x["score"], {"gain_pct": gain})
+        p["partial_taken"] = True
+        p["last_signal"] = "TP50"
+        p["last_signal_ts"] = time.time()
+        save_position(symbol, p)
+        return
+
+    if gain >= 30 and not p["partial_taken"]:
+        msg = (
+            f"🟠 SELL / TAKE PROFIT — {base}\n"
+            f"Take ~50% | price {price:.8g} | gain {gain:+.1f}%\n"
+            f"Reason: outsized move; bank part and trail the rest."
+        )
+        telegram(msg)
+        log_alert(symbol, "TAKE_PROFIT_50", price, x["score"], {"gain_pct": gain})
+        p["partial_taken"] = True
+        p["last_signal"] = "TP50"
+        p["last_signal_ts"] = time.time()
+        save_position(symbol, p)
+        return
+
+    save_position(symbol, p)
+
+
+# ---------------- VERIFIED SEC INSIDER PURCHASE/SALE MODULE ----------------
+
+def sec_headers():
+    # SEC requests should identify the automated client with a real contact.
+    if not SEC_USER_AGENT:
+        return None
+    return {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
+
+
+def get_sec_current_form4():
+    headers = sec_headers()
+    if not headers:
+        return []
+
+    params = {
+        "action": "getcurrent",
+        "type": "4",
+        "owner": "include",
+        "count": "40",
+        "output": "atom",
+    }
+
+    r = session.get(SEC_CURRENT, params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    entries = []
+
+    for entry in root.findall("a:entry", ns):
+        title = entry.findtext("a:title", default="", namespaces=ns)
+        link_el = entry.find("a:link", ns)
+        href = link_el.attrib.get("href", "") if link_el is not None else ""
+        updated = entry.findtext("a:updated", default="", namespaces=ns)
+        if href:
+            entries.append({"title": title, "url": href, "updated": updated})
+
+    return entries
+
+
+def parse_form4_from_index(index_url):
+    headers = sec_headers()
+    if not headers:
+        return None
+
+    r = session.get(index_url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    # Find candidate XML ownership docs from filing index.
+    hrefs = re.findall(r'href="([^"]+\.xml)"', r.text, flags=re.I)
+    if not hrefs:
+        return None
+
+    for href in hrefs:
+        direct = href.replace("/xslF345X05/", "/")
+        xml_url = urljoin("https://www.sec.gov", direct)
+
+        try:
+            x = session.get(xml_url, headers=headers, timeout=20)
+            if not x.ok or "<ownershipDocument" not in x.text:
+                continue
+
+            root = ET.fromstring(x.text)
+            symbol = (root.findtext(".//issuerTradingSymbol") or "").strip().upper()
+            owner = (root.findtext(".//reportingOwner/rptOwnerName") or "").strip()
+
+            transactions = []
+            for tx in root.findall(".//nonDerivativeTransaction"):
+                code = (tx.findtext(".//transactionCode") or "").strip().upper()
+                if code not in ("P", "S"):
+                    continue
+
+                shares_text = tx.findtext(".//transactionShares/value") or "0"
+                price_text = tx.findtext(".//transactionPricePerShare/value") or "0"
+                ad = (tx.findtext(".//transactionAcquiredDisposedCode/value") or "").strip().upper()
+
+                try:
+                    shares = float(shares_text)
+                except Exception:
+                    shares = 0.0
+                try:
+                    price = float(price_text)
+                except Exception:
+                    price = 0.0
+
+                transactions.append(
+                    {
+                        "code": code,
+                        "shares": shares,
+                        "price": price,
+                        "value": shares * price,
+                        "ad": ad,
+                    }
+                )
+
+            if symbol and owner and transactions:
+                return {
+                    "symbol": symbol,
+                    "owner": owner,
+                    "transactions": transactions,
+                    "source": index_url,
+                }
+
+        except Exception as exc:
+            print("SEC XML parse error:", exc)
+            continue
+
+    return None
+
+
+def scan_sec_insiders():
+    global last_sec_scan
+
+    if not ENABLE_SEC or not SEC_USER_AGENT:
+        return
+
+    if time.time() - last_sec_scan < SEC_SCAN_EVERY:
+        return
+
+    last_sec_scan = time.time()
+
+    try:
+        entries = get_sec_current_form4()
+        for entry in entries[:20]:
+            key = entry["url"]
+            if key in seen_sec_filings:
+                continue
+            seen_sec_filings.add(key)
+
+            filing = parse_form4_from_index(key)
+            time.sleep(0.12)  # stay polite with SEC access
+
+            if not filing:
+                continue
+
+            buys = [t for t in filing["transactions"] if t["code"] == "P" and t["ad"] == "A"]
+            sells = [t for t in filing["transactions"] if t["code"] == "S" and t["ad"] == "D"]
+
+            buy_value = sum(t["value"] for t in buys)
+            sell_value = sum(t["value"] for t in sells)
+
+            # Only surface material transactions. This is a disclosure, not a recommendation.
+            if buy_value >= 250_000:
+                telegram(
+                    f"📄 VERIFIED INSIDER PURCHASE — {filing['symbol']}\n"
+                    f"{filing['owner']} | ~${buy_value:,.0f}\n"
+                    f"SEC Form 4. Treat as one signal, not a BUY instruction."
+                )
+                log_alert(
+                    filing["symbol"],
+                    "SEC_INSIDER_PURCHASE",
+                    details={"owner": filing["owner"], "value": buy_value, "source": filing["source"]},
+                )
+
+            if sell_value >= 1_000_000:
+                telegram(
+                    f"📄 VERIFIED INSIDER SALE — {filing['symbol']}\n"
+                    f"{filing['owner']} | ~${sell_value:,.0f}\n"
+                    f"SEC Form 4. Sale motive is not inferred."
+                )
+                log_alert(
+                    filing["symbol"],
+                    "SEC_INSIDER_SALE",
+                    details={"owner": filing["owner"], "value": sell_value, "source": filing["source"]},
+                )
+
+    except Exception as exc:
+        print("SEC scanner error:", exc)
+
+
+# ---------------- MAIN SCANNER ----------------
+
+def process_candidate(x):
+    symbol = x["symbol"]
+    base = symbol.replace("USDT", "")
+
+    # Existing paper position gets priority so exits are never ignored.
+    if symbol in tracked and tracked[symbol]["status"] == "OPEN":
+        update_position(x)
+
+    if x["stage"] == "NONE":
+        return
+
+    news = []
+    if x["score"] >= 5 or x["stage"] == "RAPID":
+        news = get_candidate_news(base)
+
+    if x["stage"] == "RAPID":
+        key = f"{symbol}:RAPID"
+        if can_alert(key, 30 * 60):
+            telegram(alert_rapid(x, news))
+            log_alert(symbol, "RAPID_MOVE", x["price"], x["score"], x)
+            mark_alert(key)
+        return
+
+    if x["stage"] == "EARLY":
+        key = f"{symbol}:EARLY"
+        if can_alert(key, 45 * 60):
+            telegram(alert_early(x, news))
+            log_alert(symbol, "EARLY_WATCH", x["price"], x["score"], x)
+            mark_alert(key)
+        return
+
+    if x["stage"] == "CONFIRMED":
+        plan = trade_plan(x)
+        key = f"{symbol}:CONFIRMED"
+
+        if can_alert(key, 60 * 60):
+            telegram(alert_confirmed(x, plan, news))
+            log_alert(symbol, "CONFIRMED", x["price"], x["score"], {"signal": x, "plan": plan})
+            mark_alert(key)
+
+            # Track only economically sensible candidates as paper positions.
+            if plan["sensible"] and symbol not in tracked:
+                start_tracking(x, plan)
+
+
+def scan():
+    symbols = get_symbols()
+    print(f"[{utc_now()}] Scanning {len(symbols)} liquid USDT markets...")
+
+    results = []
+
+    for symbol in symbols:
+        try:
+            x = analyse(symbol)
+            if x:
+                results.append(x)
+            # Keeps request pace moderate.
+            time.sleep(0.06)
+        except requests.HTTPError as exc:
+            print(symbol, "HTTP", exc)
+        except Exception as exc:
+            print(symbol, exc)
+
+    # First update every open tracked position, even if it isn't a new candidate.
+    by_symbol = {x["symbol"]: x for x in results}
+    for symbol in list(tracked.keys()):
+        if tracked[symbol]["status"] != "OPEN":
+            continue
+        if symbol in by_symbol:
+            update_position(by_symbol[symbol])
+        else:
+            # Fetch directly because the symbol could have fallen below volume ranking.
+            try:
+                x = analyse(symbol)
+                if x:
+                    update_position(x)
+            except Exception as exc:
+                print("Tracked update error", symbol, exc)
+
+    candidates = [x for x in results if x["stage"] != "NONE"]
+    candidates.sort(
+        key=lambda x: (
+            1 if x["stage"] == "CONFIRMED" else 0,
+            x["score"],
+            x["volume_ratio"],
+            x["buy_ratio"],
+        ),
+        reverse=True,
+    )
+
+    # Process a limited number of strongest candidates to control news/API usage.
+    for x in candidates[:8]:
+        process_candidate(x)
+
+    scan_sec_insiders()
+
+
+def main():
+    db_init()
+
+    telegram(
+        "🟢 Armin Market Scanner V2 ONLINE\n"
+        "Pre-breakout + rapid-move detection + fee-aware paper tracking + dynamic exits + market-feed failover."
+    )
+
+    if ENABLE_SEC and not SEC_USER_AGENT:
+        print("SEC scanner disabled until SEC_USER_AGENT is configured.")
+
+    while True:
+        started = time.time()
+        try:
+            scan()
+        except Exception as exc:
+            print("SCAN ERROR:", exc)
+
+        elapsed = time.time() - started
+        sleep_for = max(5, SCAN_EVERY - elapsed)
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    main()
