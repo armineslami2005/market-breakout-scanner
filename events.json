@@ -1,0 +1,14 @@
+{
+  "events": [
+    {
+      "id": "eth-example-event-2027",
+      "symbol": "ETH",
+      "title": "Example only — replace with a verified event",
+      "kind": "upgrade",
+      "scheduled_at": "2027-01-20T10:00:00Z",
+      "announced_at": "2027-01-01T10:00:00Z",
+      "source_url": "https://ethereum.org/",
+      "status": "tentative"
+    }
+  ]
+}
